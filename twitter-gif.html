@@ -1,0 +1,359 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Twitter GIF Export</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #222; }
+  canvas { display: block; }
+  #status { position: fixed; top: 8px; left: 8px; color: #fff; font: 12px monospace; z-index: 5; }
+</style>
+</head>
+<body>
+<canvas id="cv"></canvas>
+<div id="status">loading…</div>
+<script>
+// ── Fixed square canvas dimensions ─────────────────────────
+var CANVAS_W = 800;
+var CANVAS_H = 800;
+var BORDER_PX = 14;
+
+// ── Animation config (from motion website) ────────────────
+var gap = 24;
+var restScale = 0.09;
+var minHoverScale = 0.9;
+var maxHoverScale = 1.4;
+
+// ── SVG sources ────────────────────────────────────────────
+var SVG_SOURCES = [
+  { file: 'svg/Australia.svg',        aspect: 1 },
+  { file: 'svg/Emu.svg',              aspect: 1 },
+  { file: 'svg/Kangaroo.svg',         aspect: 1 },
+  { file: 'svg/Frill-Lizzard.svg',    aspect: 1 },
+  { file: 'svg/Lizzard.svg',          aspect: 1 },
+  { file: 'svg/K-Bird.svg',           aspect: 1 },
+  { file: 'svg/G-Bird.svg',           aspect: 1 },
+  { file: 'svg/Echidna.svg',          aspect: 1 },
+  { file: 'svg/Platypus.svg',         aspect: 1 },
+];
+var TINTS = ['#FECE00', '#00833E'];
+
+var canvas = document.getElementById('cv');
+var ctx = canvas.getContext('2d');
+
+// Logo-exclusion mask radius (normalized to canvas min dimension)
+// Keeps shapes from drawing directly underneath the logo area.
+var LOGO_MASK_W = 0.72;  // 72% of width
+var LOGO_MASK_H = 0.22;  // 22% of height
+
+var svgImages = [];
+var svgReady = 0;
+var grid = null;
+var logoImg = null;
+var logoBounds = null; // { x, y, w, h } of opaque content within the SVG
+
+// Seeded PRNG so the grid is reproducible between page loads.
+var _seed = 0xC0FFEE;
+function srand() {
+  _seed = (_seed * 1664525 + 1013904223) & 0xFFFFFFFF;
+  return ((_seed >>> 0) / 0x100000000);
+}
+function srInt(min, max) { return Math.floor(srand() * (max - min + 1)) + min; }
+function srPick(arr) { return arr[Math.floor(srand() * arr.length)]; }
+
+function smoothstep(t) {
+  var c = Math.max(0, Math.min(1, t));
+  return c * c * (3 - 2 * c);
+}
+
+function loadSvgImages(callback) {
+  var total = SVG_SOURCES.length * TINTS.length;
+  svgImages = new Array(total);
+  SVG_SOURCES.forEach(function(src, srcIdx) {
+    fetch(src.file).then(function(r) { return r.text(); }).then(function(svgText) {
+      TINTS.forEach(function(color, tintIdx) {
+        var idx = srcIdx * TINTS.length + tintIdx;
+        var tinted = svgText.replace(
+          /(<(?:path|circle|polygon)\b[^>]*?)fill="white"/g,
+          '$1fill="' + color + '"'
+        );
+        var img = new Image();
+        img.onload = function() {
+          svgImages[idx] = { img: img, aspect: src.aspect };
+          svgReady++;
+          if (svgReady === total) callback();
+        };
+        img.src = 'data:image/svg+xml;base64,' + btoa(tinted);
+      });
+    });
+  });
+}
+
+function buildGrid() {
+  // Grid is sized to the INNER (clipped) area, not the full canvas.
+  var W = CANVAS_W - BORDER_PX * 2;
+  var H = CANVAS_H - BORDER_PX * 2;
+  var cols = Math.floor(W / gap);
+  var rows = Math.floor(H / gap);
+  var offsetX = (W - (cols - 1) * gap) / 2;
+  var offsetY = (H - (rows - 1) * gap) / 2;
+  var shapes = [];
+  var numTints = TINTS.length;
+  var grid2d = [];
+
+  for (var row = 0; row < rows; row++) {
+    grid2d[row] = [];
+    for (var col = 0; col < cols; col++) {
+      var neighborIdxs = [];
+      if (col > 0) neighborIdxs.push(grid2d[row][col - 1]);
+      if (row > 0) neighborIdxs.push(grid2d[row - 1][col]);
+      var avoidSrc = [], avoidTint = [];
+      for (var n = 0; n < neighborIdxs.length; n++) {
+        var ni = neighborIdxs[n];
+        avoidSrc.push(Math.floor(ni / numTints));
+        avoidTint.push(ni % numTints);
+      }
+      var candidates = [];
+      for (var ci = 0; ci < svgImages.length; ci++) {
+        var ciSrc = Math.floor(ci / numTints);
+        var ciTint = ci % numTints;
+        if (avoidSrc.indexOf(ciSrc) === -1 && avoidTint.indexOf(ciTint) === -1) {
+          candidates.push(ci);
+        }
+      }
+      if (candidates.length === 0) {
+        for (var ci2 = 0; ci2 < svgImages.length; ci2++) {
+          if (neighborIdxs.indexOf(ci2) === -1) candidates.push(ci2);
+        }
+      }
+      var svgIdx = candidates.length > 0 ? srPick(candidates) : srInt(0, svgImages.length - 1);
+      grid2d[row][col] = svgIdx;
+
+      shapes.push({
+        x: offsetX + col * gap,
+        y: offsetY + row * gap,
+        size: gap * 0.65,
+        scale: restScale,
+        maxScale: srand() * (maxHoverScale - minHoverScale) + minHoverScale,
+        svgIndex: svgIdx,
+      });
+    }
+  }
+
+  return { shapes: shapes, width: W, height: H };
+}
+
+// Two-phase scaling: 0→0.5 reveals outward, 0.5→1 retracts back in.
+function twoPhaseScale(norm, progress) {
+  var edge = 0.08;
+  if (progress <= 0.5) {
+    var front = progress * 2;
+    return smoothstep((front - norm + edge) / (edge * 2));
+  } else {
+    var trail = (progress - 0.5) * 2;
+    return 1 - smoothstep((trail - norm + edge) / (edge * 2));
+  }
+}
+
+function applyWave(g, progress) {
+  var W = g.width, H = g.height;
+  var cx = W / 2, cy = H / 2;
+  var maxDist = Math.sqrt(W * W + H * H) / 2;
+  for (var i = 0; i < g.shapes.length; i++) {
+    var s = g.shapes[i];
+    var dist = Math.sqrt((s.x - cx) * (s.x - cx) + (s.y - cy) * (s.y - cy));
+    var norm = dist / maxDist;
+    var t = twoPhaseScale(norm, progress);
+    s.scale = restScale + t * (s.maxScale - restScale);
+  }
+}
+
+// Continuous sinusoidal radial ripple — no start/end, always pulsing.
+// t: 0..1 over one full loop. cycles controls how many times each shape
+// pulses per loop; freq controls how many rings are visible at once.
+var HYP_CYCLES = 2;    // full oscillations per loop (integer = seamless)
+var HYP_FREQ   = 3.0;  // number of wave crests visible simultaneously
+var HYP_BASE   = 0.0;  // minimum scale (as fraction of maxScale)
+var HYP_AMP    = 1.0;  // amplitude above base (base + amp should ≤ 1)
+
+function applyHypnotic(g, t) {
+  var W = g.width, H = g.height;
+  var cx = W / 2, cy = H / 2;
+  var maxDist = Math.sqrt(W * W + H * H) / 2;
+  var TAU = Math.PI * 2;
+  for (var i = 0; i < g.shapes.length; i++) {
+    var s = g.shapes[i];
+    var dist = Math.sqrt((s.x - cx) * (s.x - cx) + (s.y - cy) * (s.y - cy));
+    var norm = dist / maxDist;
+    // Phase: wave travels outward as t increases.
+    var phase = TAU * (HYP_FREQ * norm - HYP_CYCLES * t);
+    var wave = 0.5 + 0.5 * Math.sin(phase);  // 0..1
+    var k = HYP_BASE + HYP_AMP * wave;        // 0..1
+    s.scale = restScale + k * (s.maxScale - restScale);
+  }
+}
+
+// Measure the actual opaque content bounds of the loaded logo image
+// so the visual center (not the SVG bounding-box center) can be placed
+// on the canvas center.
+function measureLogoBounds() {
+  var nw = logoImg.naturalWidth, nh = logoImg.naturalHeight;
+  var off = document.createElement('canvas');
+  off.width = nw;
+  off.height = nh;
+  var octx = off.getContext('2d');
+  octx.drawImage(logoImg, 0, 0);
+  var img = octx.getImageData(0, 0, nw, nh).data;
+  var minX = nw, minY = nh, maxX = -1, maxY = -1;
+  for (var y = 0; y < nh; y++) {
+    for (var x = 0; x < nw; x++) {
+      var a = img[(y * nw + x) * 4 + 3];
+      if (a > 8) {
+        if (x < minX) minX = x;
+        if (x > maxX) maxX = x;
+        if (y < minY) minY = y;
+        if (y > maxY) maxY = y;
+      }
+    }
+  }
+  if (maxX < 0) {
+    logoBounds = { x: 0, y: 0, w: nw, h: nh };
+  } else {
+    logoBounds = {
+      x: minX,
+      y: minY,
+      w: maxX - minX + 1,
+      h: maxY - minY + 1,
+    };
+  }
+}
+
+function drawLogo() {
+  if (!logoImg || !logoImg.complete || !logoBounds) return;
+  var W = CANVAS_W, H = CANVAS_H;
+  var nw = logoImg.naturalWidth, nh = logoImg.naturalHeight;
+  // Target width in canvas pixels, based on the tight-cropped content,
+  // so that the visible logo itself occupies ~62% of the canvas width.
+  var targetContentW = W * 0.62;
+  var scale = targetContentW / logoBounds.w;
+  var drawW = nw * scale;
+  var drawH = nh * scale;
+  // Place the content-center at the canvas center.
+  var contentCx = logoBounds.x + logoBounds.w / 2;
+  var contentCy = logoBounds.y + logoBounds.h / 2;
+  var dx = W / 2 - contentCx * scale;
+  var dy = H / 2 - contentCy * scale;
+  ctx.drawImage(logoImg, dx, dy, drawW, drawH);
+}
+
+function drawShapes() {
+  var offX = BORDER_PX;
+  var offY = BORDER_PX;
+  var maxCell = gap * 0.92;
+  var shapes = grid.shapes;
+  for (var i = 0; i < shapes.length; i++) {
+    var s = shapes[i];
+    if (s.scale < restScale * 0.15) continue;
+    var svgData = svgImages[s.svgIndex];
+    if (!svgData) continue;
+    var drawH = s.size * 2 * s.scale;
+    var drawW = drawH * svgData.aspect;
+    if (drawH > maxCell) { drawH = maxCell; drawW = drawH * svgData.aspect; }
+    if (drawW > maxCell) { drawW = maxCell; drawH = drawW / svgData.aspect; }
+    ctx.drawImage(svgData.img, offX + s.x - drawW / 2, offY + s.y - drawH / 2, drawW, drawH);
+  }
+}
+
+// logoOnTop = true  → shapes first, logo on top (v1/v2)
+// logoOnTop = false → logo first, shapes on top (v3, reveal)
+function renderFrame(logoOnTop) {
+  var W = CANVAS_W, H = CANVAS_H;
+  ctx.clearRect(0, 0, W, H);
+  ctx.fillStyle = '#FF742C';
+  ctx.fillRect(0, 0, W, H);
+
+  ctx.save();
+  ctx.beginPath();
+  ctx.rect(BORDER_PX, BORDER_PX, W - BORDER_PX * 2, H - BORDER_PX * 2);
+  ctx.clip();
+
+  if (logoOnTop) {
+    drawShapes();
+    drawLogo();
+  } else {
+    drawLogo();
+    drawShapes();
+  }
+
+  ctx.restore();
+
+  ctx.strokeStyle = '#FECE00';
+  ctx.lineWidth = BORDER_PX;
+  ctx.strokeRect(BORDER_PX / 2, BORDER_PX / 2, W - BORDER_PX, H - BORDER_PX);
+}
+
+function init() {
+  canvas.width = CANVAS_W;
+  canvas.height = CANVAS_H;
+  canvas.style.width = CANVAS_W + 'px';
+  canvas.style.height = CANVAS_H + 'px';
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  grid = buildGrid();
+}
+
+// Exposed API for Playwright-driven capture.
+window.renderAt = function(progress) {
+  if (!grid) return false;
+  applyWave(grid, progress);
+  renderFrame(true);
+  return true;
+};
+
+window.renderHypnoticAt = function(t, logoOnTop) {
+  if (!grid) return false;
+  applyHypnotic(grid, t);
+  renderFrame(logoOnTop !== false);
+  return true;
+};
+
+window.ready = false;
+
+function loadLogo(cb) {
+  logoImg = new Image();
+  logoImg.onload = function() {
+    measureLogoBounds();
+    cb();
+  };
+  logoImg.src = 'logo-white.svg';
+}
+
+loadSvgImages(function() {
+  loadLogo(function() {
+    init();
+    window.renderAt(0);
+    document.getElementById('status').textContent = 'ready';
+    window.ready = true;
+  });
+});
+
+// Capture all frames as base64 PNGs and return them concatenated.
+window.captureAll = function(numFrames) {
+  var out = [];
+  for (var i = 0; i < numFrames; i++) {
+    window.renderAt(i / numFrames);
+    out.push(canvas.toDataURL('image/png'));
+  }
+  return out.join('\n');
+};
+
+window.captureHypnotic = function(numFrames, logoOnTop) {
+  var out = [];
+  for (var i = 0; i < numFrames; i++) {
+    window.renderHypnoticAt(i / numFrames, logoOnTop);
+    out.push(canvas.toDataURL('image/png'));
+  }
+  return out.join('\n');
+};
+</script>
+</body>
+</html>
